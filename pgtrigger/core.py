@@ -794,6 +794,148 @@ class FSM(Trigger):
         '''  # noqa
 
 
+class LimitM2M(Trigger):
+    """Pevent M2M field count exceeds limit_value 
+    looks like "event_pars.places" in example:
+
+    class EventPars(models.Model):
+        places = models.PositiveIntegerField(...)
+
+    class Event(models.Model):    
+        event_pars = models.ForeignKey('EventPars'...)
+    """
+
+    when = After
+    operation = Insert
+    field = None
+    limit_value = None
+    m2m_parent = None
+
+    def __init__(
+        self, *, name=None, condition=None, field=None, limit_value=None
+    ):
+        self.field = field or self.field
+        self.limit_value = limit_value or self.limit_value
+
+        if not self.field:  # pragma: no cover
+            raise ValueError('Must provide "field" for LimitM2M')
+
+        if not self.limit_value:  # pragma: no cover
+            raise ValueError('Must provide "limit_value" for LimitM2M')
+
+        super().__init__(name=name, condition=condition)
+
+    def get_declare(self, model):
+        vars = [
+            ('_count', 'INTEGER'),
+        ]
+        if isinstance(self.limit_value, str):
+            vars.append(('_limit', 'INTEGER'));
+        return vars
+
+    def register(self, *models):
+        model = models[0]
+        self.m2m_parent = model
+        super().register(getattr(model, self.field).through().__class__)
+
+    def render_trigger(self, model):
+        """Renders the trigger declaration SQL statement"""
+        table = model._meta.db_table
+        pgid = self.get_pgid(model)
+        return f'''
+            DO $$ BEGIN
+                drop trigger if exists {pgid} on {table};
+                CREATE constraint TRIGGER {pgid}
+                    {self.when} {self.operation} ON {table}
+                    {self.referencing or ''}
+                    deferrable initially deferred
+                    FOR EACH {self.level} {self.render_condition(model)}
+                    EXECUTE PROCEDURE {pgid}();
+            EXCEPTION
+                -- Ignore issues if the trigger already exists
+                WHEN others THEN null;
+            END $$;
+        '''
+
+    def get_func(self, model):
+        m2m_field_name = getattr(self.m2m_parent, self.field).rel.name
+        col = model._meta.get_field(m2m_field_name).column
+        if isinstance(self.limit_value, str):
+            limit_fk, limit_field_name = self.limit_value.split('.')
+            limit_field = self.m2m_parent._meta.get_field(limit_fk)
+            limit_tbl = limit_field.foreign_related_fields[0]
+            _limit_sql = f'''
+                select {limit_field_name}
+                    from {limit_tbl.cached_col.alias} d
+                    join {self.m2m_parent._meta.db_table} t on
+                        d.{limit_tbl.cached_col.field.column} = t.{limit_field.column} and
+                        t.{self.m2m_parent._meta.pk.column} = new.{col}
+                    into _limit;
+            '''
+            _limit_val = '_limit'
+        else:
+            _limit_sql = ''
+            _limit_val = f'{self.limit_value}'
+        return f'''
+            select count(*)
+                from {model._meta.db_table} p
+                join {self.m2m_parent._meta.db_table} t on t.{self.m2m_parent._meta.pk.column} = p.{col}
+                where p.{col} = new.{col}
+                into _count;
+                {_limit_sql}
+            if _count > {_limit_val} then
+                raise exception
+                    'pgtrigger: Count "%" exceeds limit "%" on table %',
+                    _count,
+                    {_limit_val},
+                    TG_TABLE_NAME;
+            else
+                return new;
+            end if;
+        '''
+
+
+class CascadeFK(Trigger):
+    when = Before
+    operation = Delete
+    field = None
+    also_insert = False
+
+    def __init__(
+        self, *, name=None, condition=None, field=None, also_insert=False
+    ):
+        self.field = field or self.field
+        self.also_insert = also_insert or self.also_insert
+
+        if not self.field:  # pragma: no cover
+            raise ValueError('Must provide "field" for CascadeFK')
+
+        if self.also_insert:
+            self.operation = self.operation | Insert
+
+        super().__init__(name=name, condition=condition)
+
+    def get_func(self, model):
+        fld = model._meta.get_field(self.field)
+        col = fld.foreign_related_fields[0]
+        if self.also_insert:
+            _insert_sql = f'''
+                insert into {col.cached_col.alias} default values returning {col.column} into new.{fld.column};
+            '''
+        else:
+            _insert_sql = ''
+
+        return f'''
+                IF (TG_OP = 'DELETE') THEN
+                    delete from {col.cached_col.alias} where {col.column}=old.{fld.column};
+                    RETURN OLD;
+                ELSE
+                    {_insert_sql}
+                    RETURN NEW;
+                END IF;        
+        '''
+
+
 class SoftDelete(Trigger):
     """Sets a field to a value when a delete happens.
 

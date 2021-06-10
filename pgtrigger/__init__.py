@@ -6,6 +6,8 @@ from pgtrigger.core import disable
 from pgtrigger.core import enable
 from pgtrigger.core import F
 from pgtrigger.core import FSM
+from pgtrigger.core import LimitM2M
+from pgtrigger.core import CascadeFK
 from pgtrigger.core import get
 from pgtrigger.core import ignore
 from pgtrigger.core import Insert
@@ -39,6 +41,8 @@ __all__ = [
     'enable',
     'F',
     'FSM',
+    'LimitM2M',
+    'CascadeFK',
     'get',
     'ignore',
     'Insert',
