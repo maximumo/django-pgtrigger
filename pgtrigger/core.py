@@ -186,7 +186,6 @@ class _Operations(_Operation):
     def __str__(self):
         return ' OR '.join(str(operation) for operation in self.operations)
 
-
 #: For specifying "UPDATE" in the "operation" clause of a trigger
 Update = _Operation('UPDATE')
 
@@ -381,8 +380,11 @@ class Trigger:
     level = Row
     when = None
     operation = None
+    of_field = None
     condition = None
     referencing = None
+    constraint = False
+    declare = None
     func = None
 
     def __init__(
@@ -392,16 +394,22 @@ class Trigger:
         level=None,
         when=None,
         operation=None,
+        of_field=None,
         condition=None,
         referencing=None,
+        constraint=False,
+        declare=None,
         func=None,
     ):
         self.name = name or self.name
         self.level = level or self.level
         self.when = when or self.when
         self.operation = operation or self.operation
+        self.of_field = of_field or self.of_field
         self.condition = condition or self.condition
         self.referencing = referencing or self.referencing
+        self.constraint = constraint or self.constraint
+        self.declare = declare or self.declare
         self.func = func or self.func
 
         if not self.level or not isinstance(self.level, _Level):
@@ -450,7 +458,7 @@ class Trigger:
             List[tuple]: A list of variable name / type tuples that will
             be shown in the DECLARE. For example [('row_data', 'JSONB')]
         """
-        return []
+        return self.declare or []
 
     def get_func(self, model):
         """
@@ -461,7 +469,7 @@ class Trigger:
             raise ValueError(
                 'Must define func attribute or implement get_func'
             )
-        return self.func
+        return self.func(self, model) if isinstance(self.func, type(lambda: 1)) else self.func
 
     def get_uri(self, model):
         """The URI for the trigger in the registry"""
@@ -563,9 +571,10 @@ class Trigger:
         pgid = self.get_pgid(model)
         return f'''
             DO $$ BEGIN
-                CREATE TRIGGER {pgid}
-                    {self.when} {self.operation} ON {table}
+                CREATE {'CONSTRAINT' if self.constraint else ''} TRIGGER {pgid}
+                    {self.when} {self.operation} {f'of {self.of_field}' if self.of_field else ''} ON {table}
                     {self.referencing or ''}
+                    {'DEFERRABLE INITIALLY DEFERRED' if self.constraint else ''}
                     FOR EACH {self.level} {self.render_condition(model)}
                     EXECUTE PROCEDURE {pgid}();
             EXCEPTION
@@ -810,6 +819,7 @@ class LimitM2M(Trigger):
     field = None
     limit_value = None
     m2m_parent = None
+    constraint = True
 
     def __init__(
         self, *, name=None, condition=None, field=None, limit_value=None
@@ -837,25 +847,6 @@ class LimitM2M(Trigger):
         model = models[0]
         self.m2m_parent = model
         super().register(getattr(model, self.field).through().__class__)
-
-    def render_trigger(self, model):
-        """Renders the trigger declaration SQL statement"""
-        table = model._meta.db_table
-        pgid = self.get_pgid(model)
-        return f'''
-            DO $$ BEGIN
-                drop trigger if exists {pgid} on {table};
-                CREATE constraint TRIGGER {pgid}
-                    {self.when} {self.operation} ON {table}
-                    {self.referencing or ''}
-                    deferrable initially deferred
-                    FOR EACH {self.level} {self.render_condition(model)}
-                    EXECUTE PROCEDURE {pgid}();
-            EXCEPTION
-                -- Ignore issues if the trigger already exists
-                WHEN others THEN null;
-            END $$;
-        '''
 
     def get_func(self, model):
         m2m_field_name = getattr(self.m2m_parent, self.field).rel.name
